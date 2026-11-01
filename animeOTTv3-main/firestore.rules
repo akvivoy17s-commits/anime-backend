@@ -1,0 +1,55 @@
+rules_version = '2';
+// Rebuilt from how the app reads/writes Firestore (users, users/*/saved, users/*/state, videos, playlists).
+// COMPARE with the rules currently in your Firebase console before publishing, then deploy:  firebase deploy --only firestore:rules
+// The backend uses the Admin SDK, which bypasses these rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') == 'admin';
+    }
+
+    // Profile docs. Nobody can promote themselves: 'role' can't be added or changed from the app.
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid && !('role' in request.resource.data);
+      allow update: if signedIn() && (
+        (request.auth.uid == uid
+          && request.resource.data.get('role', null) == resource.data.get('role', null))
+        || isAdmin());
+      allow delete: if isAdmin();
+
+      match /saved/{id} { allow read, write: if signedIn() && request.auth.uid == uid; }
+      match /state/{id} { allow read, write: if signedIn() && request.auth.uid == uid; }
+    }
+
+    // Catalogue: signed-in users read, only admins write.
+    match /videos/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /playlists/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+      match /videos/{vid} {
+        allow read: if signedIn();
+        allow write: if isAdmin();
+      }
+    }
+
+    // App settings (Controls page): everyone signed in may read, ONLY the backend writes (via PUT /admin/settings).
+    match /settings/{doc} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    // Login sessions: backend only.
+    match /sessions/{doc} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
