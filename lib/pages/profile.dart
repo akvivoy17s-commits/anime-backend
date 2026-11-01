@@ -5,6 +5,8 @@ import '../ui/media.dart';
 import '../ui/neo.dart';
 import '../ui/refresh.dart';
 import '../services/admin_service.dart';
+import '../services/session_service.dart';
+import 'controls.dart';
 import 'drive_agent.dart';
 import 'login.dart';
 import 'manage_video.dart';
@@ -71,7 +73,7 @@ class _ProfilePageState extends State<ProfilePage> {
       return;
     }
 
-    await FirebaseAuth.instance.signOut();
+    await SessionService.signOut();
 
     if (!mounted) {
       return;
@@ -117,6 +119,19 @@ class _ProfilePageState extends State<ProfilePage> {
       context,
       MaterialPageRoute(
         builder: (_) => const DriveAgentPage(),
+      ),
+    );
+  }
+
+  void openControlsPage() {
+    if (!isAdmin) {
+      return;
+    }
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const ControlsPage(),
       ),
     );
   }
@@ -208,6 +223,14 @@ physics: const AlwaysScrollableScrollPhysics(),
             subtitle: 'Auto-upload every video from a Google Drive folder',
             color: Neo.amber,
             onTap: openDriveAgentPage,
+          ),
+          const SizedBox(height: 12),
+          NeoActionTile(
+            icon: Icons.tune_rounded,
+            title: 'Controls',
+            subtitle: 'Users, login limit & download permission',
+            color: Neo.pink,
+            onTap: openControlsPage,
           ),
         ],
         const SizedBox(height: 26),

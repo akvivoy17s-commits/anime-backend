@@ -5,8 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 
+import '../services/api_client.dart';
 import '../services/last_watched_service.dart';
+import '../ui/download_button.dart';
 import '../services/screen_awake_service.dart';
+import '../services/stream_perf.dart';
 import '../ui/manage_ui.dart';
 import '../ui/media.dart';
 import '../ui/neo.dart';
@@ -19,11 +22,15 @@ class VideoPlayPage extends StatefulWidget {
   /// Resume point (used by the "Continue Watching" popup).
   final Duration? startAt;
 
+  /// Open straight in fullscreen (landscape): used when next/previous is pressed in fullscreen.
+  final bool startFullscreen;
+
   const VideoPlayPage({
     super.key,
     required this.videoId,
     required this.playlistId,
     this.startAt,
+    this.startFullscreen = false,
   });
 
   @override
@@ -79,9 +86,24 @@ class _VideoPlayPageState extends State<VideoPlayPage>
   List<DocumentSnapshot<Map<String, dynamic>>> _moreVideos = [];
   bool _moreVideosLoaded = false;
 
+  // Pull-to-refresh: a pull that STARTS on the More Videos section refreshes only that section;
+  // a pull from the top (info area) refreshes the whole page. Playback is never touched.
+  final GlobalKey _moreKey = GlobalKey();
+  bool _feedGesture = false;
+  double _feedPull = 0;
+  final ValueNotifier<double> _pullUi = ValueNotifier(0);
+  bool _refreshing = false; // full-page refresh running
+  bool _refreshingMore = false; // More Videos refresh running
+  static const double _feedPullTrigger = 64;
+
   // Previous / Next (episode order inside the playlist)
   String? _prevId;
   String? _nextId;
+  String _nextUrl = ''; // original URL of the next episode (for preloading)
+  bool _preloadStarted = false;
+  bool _autoNextDone = false; // auto-play-next fires only once per episode
+  bool _inFullscreen = false; // fullscreen page handles its own auto-next
+  bool _keepLandscape = false; // handing over to the next/prev page: don't force portrait
 
   // ============================================================
   // INIT
@@ -91,6 +113,7 @@ class _VideoPlayPageState extends State<VideoPlayPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    ApiClient.wake(); // wake the backend now so Download etc. never hit a cold start
     _loadPage();
   }
 
@@ -101,6 +124,7 @@ class _VideoPlayPageState extends State<VideoPlayPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _pullUi.dispose();
     _saveTimer?.cancel();
 
     // Save the final position BEFORE the controller is disposed.
@@ -108,14 +132,17 @@ class _VideoPlayPageState extends State<VideoPlayPage>
 
     _controller?.removeListener(_videoListener);
     _controller?.dispose();
+    StreamPreload.clearSoon();
     ScreenAwakeService.release(this);
 
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    if (!_keepLandscape) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
 
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.portraitDown,
-    ]);
+      SystemChrome.setPreferredOrientations([
+        DeviceOrientation.portraitUp,
+        DeviceOrientation.portraitDown,
+      ]);
+    }
 
     super.dispose();
   }
@@ -148,6 +175,9 @@ class _VideoPlayPageState extends State<VideoPlayPage>
       _switchingLang = false;
       _moreVideos = [];
       _moreVideosLoaded = false;
+      _nextUrl = '';
+      _preloadStarted = false;
+      _autoNextDone = false;
     });
 
     try {
@@ -155,10 +185,23 @@ class _VideoPlayPageState extends State<VideoPlayPage>
       // 1. LOAD VIDEO DOCUMENT
       // ----------------------------------------------------------
 
-      final doc = await FirebaseFirestore.instance
-          .collection('videos')
-          .doc(widget.videoId)
-          .get();
+      // Cache first: the list pages already read this document, so no server round trip.
+      // (If the stored link turns out to be stale, the server copy is fetched below.)
+      DocumentSnapshot<Map<String, dynamic>>? cachedDoc;
+      try {
+        final c = await FirebaseFirestore.instance
+            .collection('videos')
+            .doc(widget.videoId)
+            .get(const GetOptions(source: Source.cache));
+        if (c.exists) cachedDoc = c;
+      } catch (_) {}
+      final usedCache = cachedDoc != null;
+
+      final doc = cachedDoc ??
+          await FirebaseFirestore.instance
+              .collection('videos')
+              .doc(widget.videoId)
+              .get();
 
       if (!doc.exists) {
         throw Exception('Video not found in Firestore.');
@@ -223,11 +266,28 @@ class _VideoPlayPageState extends State<VideoPlayPage>
 
       _thumbnail = _getThumbnailUrl(rawThumb.isNotEmpty ? rawThumb : _videoUrl);
 
+      // Show title / episode right away; only the player area keeps loading.
+      if (mounted) setState(() {});
+
       // ----------------------------------------------------------
       // 2. INITIALIZE ACTUAL VIDEO
       // ----------------------------------------------------------
 
-      await _initializeVideo(_videoUrl);
+      try {
+        await _initializeVideo(_videoUrl);
+      } catch (e) {
+        if (!usedCache) rethrow;
+        // cached document may be outdated: try the server copy once
+        final fresh = await FirebaseFirestore.instance
+            .collection('videos')
+            .doc(widget.videoId)
+            .get(const GetOptions(source: Source.server))
+            .timeout(const Duration(seconds: 15));
+        final freshUrl = _readString(fresh.data() ?? <String, dynamic>{}, ['videoUrl', 'url', 'videoURL']);
+        if (freshUrl.isEmpty || freshUrl == _videoUrl) rethrow;
+        _videoUrl = freshUrl;
+        await _initializeVideo(_videoUrl);
+      }
 
       if (!mounted) return;
 
@@ -240,6 +300,13 @@ class _VideoPlayPageState extends State<VideoPlayPage>
       });
 
       debugPrint('VIDEO INITIALIZED - LOADING STOPPED');
+
+      // Came from fullscreen next/prev -> stay in fullscreen landscape.
+      if (widget.startFullscreen) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _openFullscreen();
+        });
+      }
 
       // Save immediately (overwrites previous last watched),
       // then keep updating every 15 seconds.
@@ -326,70 +393,59 @@ class _VideoPlayPageState extends State<VideoPlayPage>
   // VIDEO URL CANDIDATES
   // ============================================================
 
-  List<String> _buildVideoCandidates(String originalUrl) {
-    final clean = originalUrl.trim();
-
-    final candidates = <String>[];
-
-    void add(String? value) {
-      if (value == null) return;
-
-      final url = value.trim();
-
-      if (url.isEmpty) return;
-
-      if (!candidates.contains(url)) {
-        candidates.add(url);
-      }
-    }
-
-    // Original URL
-    add(clean);
-
-    final fileId = _extractDriveFileId(clean);
-
-    if (fileId != null && fileId.isNotEmpty) {
-      add(
-        'https://drive.google.com/uc'
-        '?export=download&id=$fileId',
-      );
-
-      add(
-        'https://drive.google.com/uc'
-        '?export=download'
-        '&confirm=t&id=$fileId',
-      );
-
-      add(
-        'https://drive.usercontent.google.com/download'
-        '?id=$fileId'
-        '&export=download'
-        '&confirm=t',
-      );
-
-      add(
-        'https://drive.usercontent.google.com/download'
-        '?id=$fileId'
-        '&confirm=yes'
-        '&export=download',
-      );
-    }
-
-    return candidates;
-  }
+  List<String> _buildVideoCandidates(String originalUrl) => StreamCandidates.build(originalUrl);
 
   // ============================================================
   // INITIALIZE VIDEO
   // ============================================================
 
   Future<void> _initializeVideo(String originalUrl, {Duration? resumeAt}) async {
-    final candidates = _buildVideoCandidates(originalUrl);
+    var candidates = _buildVideoCandidates(originalUrl);
 
     if (candidates.isEmpty) {
       throw Exception('No valid video URL found.');
     }
 
-    for (final url in candidates) {
+    final sw = Stopwatch()..start();
+
+    // The previous episode already prepared this one -> start right away.
+    final pre = kStreamOptimizations ? StreamPreload.take(originalUrl) : null;
+    if (pre != null) {
+      try {
+        await pre.setPlaybackSpeed(_playbackSpeed);
+        final at = resumeAt ?? widget.startAt;
+        if (at != null && at > Duration.zero && at < pre.value.duration) await pre.seekTo(at);
+        if (!mounted) {
+          await pre.dispose();
+          return;
+        }
+        _controller = pre;
+        _controller!.addListener(_videoListener);
+        await _controller!.play();
+        StreamPerf.record('player-ready', sw.elapsedMilliseconds, note: 'preloaded');
+        return;
+      } catch (_) {
+        await pre.dispose(); // fall through to the normal start
+      }
+    }
+
+    String? cachedUrl;
+    if (kStreamOptimizations) {
+      // (a) the URL that worked last time -> start immediately, no guessing
+      cachedUrl = await StreamUrlCache.get(originalUrl);
+      if (cachedUrl != null && candidates.contains(cachedUrl)) {
+        candidates = [cachedUrl, ...candidates.where((c) => c != cachedUrl)];
+      } else {
+        cachedUrl = null;
+        // (b) otherwise probe all variants in parallel and try the one that answers first
+        candidates = await StreamProbe.order(candidates);
+        StreamPerf.record('probe', sw.elapsedMilliseconds);
+      }
+    }
+
+    var queue = List<String>.from(candidates);
+    while (queue.isNotEmpty) {
+      final url = queue.removeAt(0);
       VideoPlayerController? testController;
 
       try {
@@ -400,7 +456,11 @@ class _VideoPlayPageState extends State<VideoPlayPage>
           videoPlayerOptions: VideoPlayerOptions(mixWithOthers: false),
         );
 
-        await testController.initialize();
+        // a link that hangs must not block the fallbacks
+        await testController.initialize().timeout(Duration(seconds: queue.isEmpty ? 25 : 10));
+        StreamPerf.record('player-ready', sw.elapsedMilliseconds,
+            note: cachedUrl == url ? 'cached url' : (url == candidates.first ? 'first candidate' : 'fallback'));
+        if (kStreamOptimizations) unawaited(StreamUrlCache.put(originalUrl, url));
 
         await testController.setPlaybackSpeed(_playbackSpeed);
 
@@ -432,6 +492,11 @@ class _VideoPlayPageState extends State<VideoPlayPage>
         debugPrint('VIDEO ERROR: $e');
 
         await testController?.dispose();
+        if (url == cachedUrl) {
+          unawaited(StreamUrlCache.remove(originalUrl)); // stale -> forget it
+          // pick the fastest of the remaining variants instead of trying them one by one
+          if (kStreamOptimizations && queue.length > 1) queue = await StreamProbe.order(queue);
+        }
       }
     }
 
@@ -492,6 +557,40 @@ class _VideoPlayPageState extends State<VideoPlayPage>
     return '${_readString(d, ['category'])}|$season|$ep|$base';
   }
 
+  /// Only the videos that can belong to the same episode group (was: the WHOLE videos collection on every open).
+  /// Falls back to the full read if the narrowed query fails.
+  Future<QuerySnapshot<Map<String, dynamic>>> _groupCandidates(Map<String, dynamic> data) async {
+    final col = FirebaseFirestore.instance.collection('videos');
+    try {
+      Query<Map<String, dynamic>>? q;
+      for (final f in const ['langGroup', 'groupId']) {
+        final v = data[f];
+        if (v != null && v.toString().trim().isNotEmpty) {
+          q = col.where(f, isEqualTo: v);
+          break;
+        }
+      }
+      if (q == null) {
+        final cat = data['category'];
+        if (cat != null && cat.toString().trim().isNotEmpty) {
+          var byCat = col.where('category', isEqualTo: cat);
+          for (final f in const ['season', 'seasonNumber']) {
+            final v = data[f];
+            if (v != null && v.toString().trim().isNotEmpty) {
+              byCat = byCat.where(f, isEqualTo: v);
+              break;
+            }
+          }
+          q = byCat;
+        }
+      }
+      if (q != null) return await q.get();
+    } catch (e) {
+      debugPrint('Group query failed, reading all videos: $e');
+    }
+    return col.get();
+  }
+
   Future<void> _loadLanguages(Map<String, dynamic> data) async {
     final id = widget.videoId;
     final found = <String, String>{};
@@ -509,7 +608,7 @@ class _VideoPlayPageState extends State<VideoPlayPage>
 
     // (b) separate docs of the same episode, one per language
     try {
-      final snap = await FirebaseFirestore.instance.collection('videos').get();
+      final snap = await _groupCandidates(data);
       final key = _groupKey(data);
       for (final d in snap.docs) {
         if (d.id == id) continue;
@@ -662,7 +761,7 @@ class _VideoPlayPageState extends State<VideoPlayPage>
       title: 'Audio tracks (debug)',
       sub: 'RAW',
       child: SelectableText(
-        _trackDebug,
+        '$_trackDebug\n\n${StreamPerf.summary()}',
         style: const TextStyle(
           color: Neo.text,
           fontFamily: Neo.mono,
@@ -741,6 +840,31 @@ class _VideoPlayPageState extends State<VideoPlayPage>
     }
     _wasPlaying = isPlaying;
     ScreenAwakeService.set(this, isPlaying && _fg); // on only while playing
+
+    // ~60% watched -> get the next episode's player ready in the background
+    if (!_preloadStarted && _nextUrl.isNotEmpty) {
+      final v = _controller!.value;
+      if (v.isInitialized && v.duration.inSeconds > 60 && v.position.inMilliseconds > v.duration.inMilliseconds * 0.3) {
+        _preloadStarted = true;
+        unawaited(StreamPreload.prepare(_nextUrl, _buildVideoCandidates(_nextUrl)));
+      }
+    }
+
+    // Episode finished -> automatically play the next one in the playlist.
+    // (In fullscreen the fullscreen page pops with 'next' instead.)
+    if (!_autoNextDone && !_inFullscreen && !_loading && !_switchingLang && _nextId != null) {
+      final v = _controller!.value;
+      final ended = v.isInitialized &&
+          v.duration > Duration.zero &&
+          (v.isCompleted ||
+              (!v.isPlaying && v.position >= v.duration - const Duration(milliseconds: 300)));
+      if (ended) {
+        _autoNextDone = true;
+        final id = _nextId;
+        Future.microtask(() => _goToVideo(id));
+        return;
+      }
+    }
 
     if (!_loading) {
       setState(() {});
@@ -924,6 +1048,7 @@ class _VideoPlayPageState extends State<VideoPlayPage>
 
     if (!mounted) return;
 
+    _inFullscreen = true;
     final result = await Navigator.of(context).push<String>(
       MaterialPageRoute(
         builder: (_) {
@@ -947,6 +1072,14 @@ class _VideoPlayPageState extends State<VideoPlayPage>
       ),
     );
 
+    _inFullscreen = false;
+
+    // next / previous from fullscreen: stay landscape, new page opens fullscreen itself
+    if (result == 'prev' || result == 'next') {
+      _goToVideo(result == 'prev' ? _prevId : _nextId, fullscreen: true);
+      return;
+    }
+
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
 
     await SystemChrome.setPreferredOrientations([
@@ -961,8 +1094,6 @@ class _VideoPlayPageState extends State<VideoPlayPage>
       return;
     }
 
-    if (result == 'prev') _goToVideo(_prevId);
-    if (result == 'next') _goToVideo(_nextId);
   }
 
   // ============================================================
@@ -994,7 +1125,8 @@ class _VideoPlayPageState extends State<VideoPlayPage>
     final controller = _controller;
 
     if (controller == null || !controller.value.isInitialized) {
-      return const ColoredBox(color: Colors.black);
+      // Loading animation lives ONLY inside the player area (not the whole page).
+      return _loading ? _buildPlayerLoading() : const ColoredBox(color: Colors.black);
     }
 
     final width = controller.value.size.width;
@@ -1339,25 +1471,35 @@ class _VideoPlayPageState extends State<VideoPlayPage>
     );
   }
 
-  void _goToVideo(String? id) {
+  void _goToVideo(String? id, {bool fullscreen = false}) {
     if (id == null || id.isEmpty || !mounted) return;
+    // keep the current landscape orientation (fullscreen or landscape page) across the switch
+    _keepLandscape =
+        fullscreen || MediaQuery.of(context).orientation == Orientation.landscape;
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(
-        builder: (_) => VideoPlayPage(videoId: id, playlistId: widget.playlistId),
+        builder: (_) => VideoPlayPage(
+          videoId: id,
+          playlistId: widget.playlistId,
+          startFullscreen: fullscreen,
+        ),
       ),
     );
   }
 
-  Widget _buildLoadingScreen() {
+  /// Loading animation shown only where the video controls will appear (the player area).
+  Widget _buildPlayerLoading() {
     return Stack(
+      fit: StackFit.expand,
       children: [
+        const ColoredBox(color: Colors.black),
         const Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               CircularProgressIndicator(color: Neo.cyan),
-              SizedBox(height: 16),
+              SizedBox(height: 12),
               Text(
                 'LOADING STREAM',
                 style: TextStyle(
@@ -1370,13 +1512,14 @@ class _VideoPlayPageState extends State<VideoPlayPage>
             ],
           ),
         ),
-        SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: GlassIconButton(
-              icon: Icons.arrow_back_ios_new_rounded,
-              onTap: () => Navigator.of(context).maybePop(),
-            ),
+        Positioned(
+          left: 8,
+          top: 8,
+          child: _controlButton(
+            icon: Icons.arrow_back_ios_new_rounded,
+            size: 38,
+            iconSize: 18,
+            onTap: () => Navigator.of(context).maybePop(),
           ),
         ),
       ],
@@ -1565,20 +1708,17 @@ class _VideoPlayPageState extends State<VideoPlayPage>
     // LOAD ALL VIDEOS
     // ----------------------------------------------------------
 
-    for (final id in allIds) {
+    // all documents in parallel (was one round-trip per video)
+    final fetched = await Future.wait(allIds.map((id) async {
       try {
-        final doc = await FirebaseFirestore.instance
-            .collection('videos')
-            .doc(id)
-            .get();
-
-        if (doc.exists) {
-          results.add(doc);
-        }
+        final doc = await FirebaseFirestore.instance.collection('videos').doc(id).get();
+        return doc.exists ? doc : null;
       } catch (e) {
         debugPrint('Could not load video $id: $e');
+        return null;
       }
-    }
+    }));
+    results.addAll(fetched.whereType<DocumentSnapshot<Map<String, dynamic>>>());
 
     // ----------------------------------------------------------
     // SORT ASCENDING BY EPISODE
@@ -1599,6 +1739,9 @@ class _VideoPlayPageState extends State<VideoPlayPage>
     final cur = results.indexWhere((d) => d.id == widget.videoId);
     _prevId = cur > 0 ? results[cur - 1].id : null;
     _nextId = (cur >= 0 && cur < results.length - 1) ? results[cur + 1].id : null;
+    _nextUrl = _nextId == null
+        ? ''
+        : _readString(results[cur + 1].data() ?? <String, dynamic>{}, ['videoUrl', 'url', 'videoURL']);
 
     results.removeWhere((d) => d.id == widget.videoId);
 
@@ -1606,8 +1749,159 @@ class _VideoPlayPageState extends State<VideoPlayPage>
   }
 
   // ============================================================
+  // PULL TO REFRESH
+  // ============================================================
+
+  void _snack(String m) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(m), behavior: SnackBarBehavior.floating));
+  }
+
+  /// Throws when offline (server read can't be served from cache).
+  Future<DocumentSnapshot<Map<String, dynamic>>> _serverVideoDoc() => FirebaseFirestore.instance
+      .collection('videos')
+      .doc(widget.videoId)
+      .get(const GetOptions(source: Source.server))
+      .timeout(const Duration(seconds: 15));
+
+  String _refreshError(Object e) => (e is TimeoutException || e is FirebaseException)
+      ? "You're offline or the server is slow. Please try again."
+      : "Couldn't refresh. Please try again.";
+
+  Future<bool> _reloadMore() async {
+    try {
+      final r = await _loadMoreVideos();
+      if (!mounted) return false;
+      if (r.isEmpty && _moreVideos.isNotEmpty) return false; // keep what the user already sees
+      setState(() {
+        _moreVideos = r;
+        _moreVideosLoaded = true;
+      });
+      return true;
+    } catch (e) {
+      debugPrint('MORE VIDEOS REFRESH ERROR: $e');
+      return false;
+    }
+  }
+
+  /// Pull on the More Videos section: reload only that section. Player, position and scroll state stay.
+  Future<void> _refreshMore() async {
+    if (_refreshing || _refreshingMore || _loading || _hasError) return;
+    setState(() => _refreshingMore = true);
+    try {
+      await _serverVideoDoc();
+      if (!await _reloadMore()) _snack("Couldn't refresh More Videos.");
+    } catch (e) {
+      _snack(_refreshError(e));
+    } finally {
+      if (mounted) setState(() => _refreshingMore = false);
+    }
+  }
+
+  /// Pull from the very top: re-sync the whole page (details, languages, More Videos)
+  /// WITHOUT re-creating the player, so playback continues.
+  Future<void> _refreshPage() async {
+    if (_refreshing || _refreshingMore || _loading || _hasError) return;
+    _refreshing = true;
+    try {
+      final doc = await _serverVideoDoc();
+      final data = doc.data();
+      if (!mounted) return;
+      if (!doc.exists || data == null) {
+        _snack('This video is no longer available.');
+        return;
+      }
+      setState(() {
+        _title = _readString(data, ['title', 'name', 'videoTitle'], fallback: _title);
+        _season = _readString(data, ['season', 'seasonNumber']);
+        _episode = _readString(data, ['episodes', 'episodeNumber', 'episode', 'episodeNo', 'ep']);
+      });
+      final ok = await Future.wait([_reloadMore(), _loadLanguages(data).then((_) => true)]);
+      if (!ok.first) _snack("Couldn't refresh More Videos.");
+    } catch (e) {
+      _snack(_refreshError(e));
+    } finally {
+      _refreshing = false;
+    }
+  }
+
+  void _onPointerDown(PointerDownEvent e) {
+    _feedPull = 0;
+    _pullUi.value = 0;
+    final ro = _moreKey.currentContext?.findRenderObject();
+    var inFeed = false;
+    if (ro is RenderBox && ro.attached && ro.hasSize && ro.size.height > 0) {
+      inFeed = (ro.localToGlobal(Offset.zero) & ro.size).contains(e.position);
+    }
+    _feedGesture = inFeed;
+  }
+
+  void _onPointerEnd(PointerEvent e) {
+    final pulled = _feedPull;
+    final feed = _feedGesture;
+    _feedPull = 0;
+    _pullUi.value = 0;
+    if (feed && pulled >= _feedPullTrigger) _refreshMore();
+  }
+
+  bool _onFeedScroll(ScrollNotification n) {
+    if (n.depth != 0 || !_feedGesture) return false;
+    if (n is ScrollUpdateNotification && n.dragDetails != null) {
+      final over = n.metrics.minScrollExtent - n.metrics.pixels; // > 0 while pulled past the top
+      _feedPull = over > 0 ? over : 0;
+      _pullUi.value = _feedPull.clamp(0.0, 120.0).toDouble();
+    }
+    return false;
+  }
+
+  Widget _feedPullHint() => ValueListenableBuilder<double>(
+        valueListenable: _pullUi,
+        builder: (_, v, __) {
+          if (v < 8) return const SizedBox.shrink();
+          final ready = v >= _feedPullTrigger;
+          return Positioned(
+            top: 8,
+            left: 0,
+            right: 0,
+            child: IgnorePointer(
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Neo.surface,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: (ready ? Neo.cyan : Neo.line)),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.refresh_rounded, size: 16, color: ready ? Neo.cyan : Neo.muted),
+                    const SizedBox(width: 8),
+                    Text(ready ? 'Release to refresh More Videos' : 'Pull to refresh More Videos',
+                        style: TextStyle(color: ready ? Neo.cyan : Neo.muted, fontSize: 12)),
+                  ]),
+                ),
+              ),
+            ),
+          );
+        },
+      );
+
+  // ============================================================
   // LOAD MORE VIDEOS IN BACKGROUND
   // ============================================================
+
+  /// While this episode plays, find the working URL of the next two so they start instantly.
+  Future<void> _warmUpNext() async {
+    final jobs = <Future<void>>[];
+    for (final d in _moreVideos.take(4)) {
+      if (!mounted) return;
+      final url = _readString(d.data() ?? <String, dynamic>{}, ['videoUrl', 'url', 'videoURL']);
+      if (url.isEmpty) continue;
+      jobs.add(StreamWarm.url(url, _buildVideoCandidates(url)));
+    }
+    await Future.wait(jobs);
+  }
 
   Future<void> _loadMoreVideosInBackground() async {
     try {
@@ -1621,6 +1915,7 @@ class _VideoPlayPageState extends State<VideoPlayPage>
       });
 
       debugPrint('MORE VIDEOS: ${_moreVideos.length}');
+      unawaited(_warmUpNext());
     } catch (e) {
       debugPrint('MORE VIDEOS LOAD ERROR: $e');
 
@@ -1679,6 +1974,14 @@ class _VideoPlayPageState extends State<VideoPlayPage>
             tag: '${_moreVideos.length} up next',
             color: Neo.violet,
           ),
+          if (_refreshingMore)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: const LinearProgressIndicator(minHeight: 3, color: Neo.violet, backgroundColor: Colors.white10),
+              ),
+            ),
           const SizedBox(height: 14),
           ..._moreVideos.map((doc) {
             final data = doc.data();
@@ -1801,28 +2104,54 @@ class _VideoPlayPageState extends State<VideoPlayPage>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          GestureDetector(
-            onLongPress: _showTrackDebug, // long-press title = raw audio track list
-            child: Text(
-              _title,
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: Neo.text,
-                fontSize: 22,
-                fontWeight: FontWeight.w800,
-                height: 1.2,
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (_season.isNotEmpty) _infoChip('SEASON $_season', Neo.violet),
-              if (_episode.isNotEmpty) _infoChip('EP $_episode', Neo.cyan),
-              _infoChip('SPEED ${_fmtSpeed(_playbackSpeed)}', Neo.amber),
+              // round download button on the LEFT, title + chips on its right
+              DownloadButton(
+                key: ValueKey('dl_${widget.videoId}_$_activeLang'),
+                videoId: widget.videoId,
+                variant: _langUrls.length >= 2 ? _activeLang : '',
+                url: _videoUrl,
+                title: _title,
+                subtitle: [
+                  if (_season.isNotEmpty) 'S$_season',
+                  if (_episode.isNotEmpty) 'EP $_episode',
+                  if (_langUrls.length >= 2 && _activeLang.isNotEmpty) (_langShort[_activeLang] ?? ''),
+                ].where((e) => e.isNotEmpty).join(' · '),
+                thumbnail: _thumbnail,
+              ),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    GestureDetector(
+                      onLongPress: _showTrackDebug, // long-press title = raw audio track list
+                      child: Text(
+                        _title,
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Neo.text,
+                          fontSize: 22,
+                          fontWeight: FontWeight.w800,
+                          height: 1.2,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        if (_season.isNotEmpty) _infoChip('SEASON $_season', Neo.violet),
+                        if (_episode.isNotEmpty) _infoChip('EP $_episode', Neo.cyan),
+                        _infoChip('SPEED ${_fmtSpeed(_playbackSpeed)}', Neo.amber),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
             ],
           ),
           if (_availLangs.length >= 2) ...[
@@ -1855,11 +2184,9 @@ class _VideoPlayPageState extends State<VideoPlayPage>
       backgroundColor: Neo.bg,
       body: _hasError
           ? _buildErrorScreen()
-          : _loading
-              ? _buildLoadingScreen()
-              : isLandscape
-                  ? _buildLandscapePage()
-                  : _buildPortraitPage(),
+          : isLandscape
+              ? _buildLandscapePage()
+              : _buildPortraitPage(),
     );
   }
 
@@ -1887,16 +2214,29 @@ class _VideoPlayPageState extends State<VideoPlayPage>
                 ),
               ),
               Expanded(
-                child: NeoRefresh(
-                  onRefresh: _loadPage,
-                  child: ListView(
-                  physics: const BouncingScrollPhysics(
-                      parent: AlwaysScrollableScrollPhysics()),
-                  children: [
-                    _buildVideoInfo(),
-                    _buildRelatedVideos(),
-                  ],
-                )),
+                child: Listener(
+                  onPointerDown: _onPointerDown,
+                  onPointerUp: _onPointerEnd,
+                  onPointerCancel: _onPointerEnd,
+                  child: Stack(children: [
+                    NotificationListener<ScrollNotification>(
+                      onNotification: _onFeedScroll,
+                      child: NeoRefresh(
+                        onRefresh: _refreshPage,
+                        // a pull that began on the More Videos section is NOT a full-page refresh
+                        notificationPredicate: (n) => n.depth == 0 && !_feedGesture,
+                        child: ListView(
+                          physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+                          children: [
+                            if (_title.isNotEmpty) _buildVideoInfo(),
+                            Container(key: _moreKey, child: _buildRelatedVideos()),
+                          ],
+                        ),
+                      ),
+                    ),
+                    _feedPullHint(),
+                  ]),
+                ),
               ),
             ],
           ),
@@ -1976,8 +2316,25 @@ class _FullscreenVideoPageState extends State<_FullscreenVideoPage> {
   // LISTENER
   // ============================================================
 
+  bool _autoNextSent = false;
+
   void _videoListener() {
     if (!mounted) return;
+
+    // Episode ended while in fullscreen -> hand 'next' back to the player page.
+    final v = widget.controller.value;
+    if (!_autoNextSent &&
+        widget.hasNext &&
+        v.isInitialized &&
+        v.duration > Duration.zero &&
+        (v.isCompleted ||
+            (!v.isPlaying && v.position >= v.duration - const Duration(milliseconds: 300)))) {
+      _autoNextSent = true;
+      Future.microtask(() {
+        if (mounted) Navigator.pop(context, 'next');
+      });
+      return;
+    }
 
     setState(() {});
   }

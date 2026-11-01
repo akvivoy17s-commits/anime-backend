@@ -1,3 +1,4 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'neo.dart';
@@ -97,12 +98,14 @@ class NeoImage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (url.isEmpty) return _ph();
-    return Image.network(
-      url,
+    // disk + memory cache (thumbnails also show offline once seen); decoded at a sane size for smooth scrolling
+    return CachedNetworkImage(
+      imageUrl: url,
       fit: BoxFit.cover,
-      gaplessPlayback: true,
-      loadingBuilder: (c, child, p) => p == null ? child : const Shimmer(),
-      errorBuilder: (_, __, ___) => _ph(),
+      fadeInDuration: const Duration(milliseconds: 120),
+      memCacheWidth: 640,
+      placeholder: (_, __) => const Shimmer(),
+      errorWidget: (_, __, ___) => _ph(),
     );
   }
 

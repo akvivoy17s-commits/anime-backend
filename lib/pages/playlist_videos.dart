@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import '../ui/manage_ui.dart';
 import '../ui/media.dart';
 import '../ui/neo.dart';
+import '../services/stream_perf.dart';
 import 'video_play.dart';
 
 class PlaylistVideosPage extends StatefulWidget {
@@ -130,7 +133,36 @@ class _PlaylistVideosPageState extends State<PlaylistVideosPage> {
       return aEpisode.compareTo(bEpisode);
     });
 
+    // get the first episodes' stream links ready while the user looks at the list
+    unawaited(StreamWarm.fromDocs(videos.map((d) => d.data())));
+
+    // Episode 1: build a fully initialized player NOW, so tapping it starts playing instantly.
+    if (videos.isNotEmpty) {
+      _firstId = videos.first.id;
+      final url = _videoUrlOf(videos.first.data() ?? {});
+      if (url.isNotEmpty) {
+        unawaited(StreamPreload.prepare(url, StreamCandidates.build(url)));
+      }
+    }
+
     return videos;
+  }
+
+  String? _firstId; // first (lowest episode) video of this playlist
+
+  String _videoUrlOf(Map<String, dynamic> d) {
+    for (final k in const ['videoUrl', 'url', 'videoURL']) {
+      final v = (d[k] ?? '').toString().trim();
+      if (v.isNotEmpty) return v;
+    }
+    return '';
+  }
+
+  @override
+  void dispose() {
+    // leaving the playlist without playing -> free the prepared player
+    StreamPreload.clear();
+    super.dispose();
   }
 
   // ===========================================================
@@ -373,6 +405,8 @@ class _PlaylistVideosPageState extends State<PlaylistVideosPage> {
   }) {
     return Tilt3D(
       onTap: () {
+        // another episode chosen -> the prepared first-episode player is not needed
+        if (videoId != _firstId) StreamPreload.clear();
         Navigator.push(
           context,
           MaterialPageRoute(

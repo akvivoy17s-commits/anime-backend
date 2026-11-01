@@ -260,27 +260,34 @@ class _ManageVideoPageState extends State<ManageVideoPage>
 
   // =========================================================
   // GROUP: ANIME (category) -> SEASON -> EPISODE
-  // Latest uploaded anime first, latest uploaded season first.
+  // Latest uploaded anime first, latest uploaded season first, episodes in EP order.
   // =========================================================
 
   static const String _noAnime = 'Uncategorized';
 
-  // true  => episodes inside a season: newest upload first
-  // false => episodes inside a season: EP 1, 2, 3...
-  static const bool _episodesNewestFirst = true;
+  /// Episode number as a number ("5", "EP 05", "12.5" -> 5, 5, 12.5). No number = last.
+  double _episodeValue(dynamic value) {
+    if (value is num) return value.toDouble();
+    final m = RegExp(r'\d+(?:\.\d+)?').firstMatch(value?.toString() ?? '');
+    return m == null ? double.infinity : (double.tryParse(m.group(0)!) ?? double.infinity);
+  }
 
-  int _compareVideoData(Map<String, dynamic> a, Map<String, dynamic> b) {
-    final seasonA = _getNumber(a['season']);
-    final seasonB = _getNumber(b['season']);
-    if (seasonA != seasonB) return seasonA.compareTo(seasonB);
+  int _createdMs(Map<String, dynamic> d) {
+    final v = d['createdAt'];
+    return v is Timestamp ? v.millisecondsSinceEpoch : 9007199254740991;
+  }
 
-    final episodeA = _getEpisodeNumber(a['episodes']);
-    final episodeB = _getEpisodeNumber(b['episodes']);
-    if (episodeA != episodeB) return episodeA.compareTo(episodeB);
-
-    final titleA = (a['title'] ?? '').toString().toLowerCase();
-    final titleB = (b['title'] ?? '').toString().toLowerCase();
-    return titleA.compareTo(titleB);
+  /// Episodes inside a season are ALWAYS in episode order, highest first (EP 12, 11, ... 2, 1),
+  /// whatever order they were uploaded in. Videos without an episode number go last.
+  int _compareEpisodes(Map<String, dynamic> a, Map<String, dynamic> b) {
+    final ea = _episodeValue(a['episodes']);
+    final eb = _episodeValue(b['episodes']);
+    if (ea.isInfinite != eb.isInfinite) return ea.isInfinite ? 1 : -1; // no number = last
+    final c = eb.compareTo(ea); // descending
+    if (c != 0) return c;
+    final t = _createdMs(b).compareTo(_createdMs(a)); // same number: newer upload first
+    if (t != 0) return t;
+    return (a['title'] ?? '').toString().toLowerCase().compareTo((b['title'] ?? '').toString().toLowerCase());
   }
 
   DateTime _createdOf(Map<String, dynamic> d) {
@@ -303,7 +310,8 @@ class _ManageVideoPageState extends State<ManageVideoPage>
 
     for (final doc in docs) {
       final data = doc.data();
-      final raw = (data['category'] ?? '').toString().trim();
+      // One group per ANIME = its title ("category" is only series/movies, not the anime).
+      final raw = (data['title'] ?? '').toString().trim().replaceAll(RegExp(r'\s+'), ' ');
       final name = raw.isEmpty ? _noAnime : raw;
       final key = name.toLowerCase();
       final season = _getNumber(data['season']);
@@ -344,20 +352,14 @@ class _ManageVideoPageState extends State<ManageVideoPage>
         });
 
       for (final season in seasonKeys) {
-        items.add(
-          _GroupHeader(season == 999999 ? 'No Season' : 'Season $season'),
-        );
+        // movies / single-season-less titles: no pointless "No Season" header
+        if (!(season == 999999 && seasonKeys.length == 1)) {
+          items.add(
+            _GroupHeader(season == 999999 ? 'No Season' : 'Season $season'),
+          );
+        }
 
-        final list = seasons[season]!
-          ..sort((a, b) {
-            if (_episodesNewestFirst) {
-              final c = _createdOf(b.data()).compareTo(_createdOf(a.data()));
-              if (c != 0) return c;
-              return _getEpisodeNumber(b.data()['episodes'])
-                  .compareTo(_getEpisodeNumber(a.data()['episodes']));
-            }
-            return _compareVideoData(a.data(), b.data());
-          });
+        final list = seasons[season]!..sort((a, b) => _compareEpisodes(a.data(), b.data()));
 
         items.addAll(list);
       }
@@ -596,6 +598,29 @@ class _ManageVideoPageState extends State<ManageVideoPage>
       neoSnack(context, 'Movie released');
     } catch (e) {
       showError('Release failed: $e');
+    }
+  }
+
+  Future<void> _unreleaseMovie(String videoId, String title) async {
+    final ok = await neoConfirm(
+      context,
+      title: 'Unrelease Movie?',
+      message: '"$title" Movies page, Home, Search-la irundhu maraiyum. '
+          'Marupadiyum Release pannum varai yaarukkum theriyaadhu.',
+      confirmLabel: 'UNRELEASE',
+      danger: true,
+    );
+    if (!ok) return;
+    try {
+      await _firestore.collection('videos').doc(videoId).update({
+        'released': false,
+        'releasedAt': FieldValue.delete(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      if (!mounted) return;
+      neoSnack(context, 'Movie unreleased');
+    } catch (e) {
+      showError('Unrelease failed: $e');
     }
   }
 
@@ -1999,8 +2024,9 @@ physics: const AlwaysScrollableScrollPhysics(),
     final episode = data['episodes']?.toString() ?? '';
     final thumbnail = data['thumbnailUrl']?.toString() ?? '';
     final selected = _selectedIds.contains(doc.id);
-    final unreleased =
-        category.trim().toLowerCase() == 'movies' && data['released'] == false;
+    final isMovie = category.trim().toLowerCase() == 'movies';
+    final unreleased = isMovie && data['released'] == false;
+    final released = isMovie && data['released'] != false;
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -2073,6 +2099,15 @@ physics: const AlwaysScrollableScrollPhysics(),
                     tooltip: 'Release',
                     color: Neo.amber,
                     onTap: () => _releaseMovie(doc.id, title),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+                if (released) ...[
+                  _miniAction(
+                    icon: Icons.visibility_off_outlined,
+                    tooltip: 'Unrelease',
+                    color: Neo.violet,
+                    onTap: () => _unreleaseMovie(doc.id, title),
                   ),
                   const SizedBox(height: 8),
                 ],

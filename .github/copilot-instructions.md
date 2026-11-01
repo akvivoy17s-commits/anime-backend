@@ -10,11 +10,18 @@
 
 
 
+
+
+
+
+
+
+
 <!-- github-copilot-toolbox:mcp-skills-awareness-begin -->
 
 ### MCP & Skills awareness (GitHub Copilot Toolbox)
 
-_Last synced: 2026-10-06T15:01:37.616Z._
+_Last synced: 2026-11-01T11:53:30.578Z._
 
 - **Full report:** `.github/copilot-toolbox-mcp-skills-awareness.md` in this workspace (auto-overwritten on each scan). Use it as ground truth for configured servers and skill folders.
 - **MCP:** For **live tools**, use **Copilot Chat → Agent** and **trust/start** the right servers in the MCP UI.
@@ -23,7 +30,7 @@ _Last synced: 2026-10-06T15:01:37.616Z._
 
 #### Workspace MCP
 
-- `c:\Users\Ajmal Khan\Music\final\animeOTTv3\.vscode\mcp.json` _(workspace: animeOTTv3)_ — _file missing_
+- `c:\Users\Ajmal Khan\Desktop\New folder (4)\animeOTTv3\.vscode\mcp.json` _(workspace: animeOTTv3)_ — _file missing_
 
 _No active workspace servers in mcp.json._
 
@@ -45,7 +52,7 @@ _None found (or no workspace open)._
 
 - **deploy-to-hosting** — `C:\Users\Ajmal Khan\.copilot\skills\deploy-to-hosting` — Deploy an existing project to a website on Hostinger web hosting (Shared, Cloud or Agency plans) and keep it deployed: picks the right deploy for static sites, Node.js apps (Next.js, Nuxt, Express, Vite and similar), PHP
 
-- **hostinger-headless** — `C:\Users\Ajmal Khan\.copilot\skills\hostinger-headless` — Build, connect, or iterate on a website hosted on Hostinger — provision hosting and a domain, optionally seed an ecommerce store with a real hosted checkout or a WordPress content backend (headless CMS/blog), build the f
+- **hostinger-headless** — `C:\Users\Ajmal Khan\.copilot\skills\hostinger-headless` — Orchestrator for the Hostinger Headless build flow — build and deploy a real website on the user's Hostinger account from a single prompt that names a domain. Holds the stage flow and the state contract, and drives each 
 
 - **maintain-wordpress** — `C:\Users\Ajmal Khan\.copilot\skills\maintain-wordpress` — Keep WordPress sites on Hostinger web hosting updated and secure: checks core, plugin and theme versions, known vulnerabilities and install health on one site or every site in the account, reports what needs doing, appli
 

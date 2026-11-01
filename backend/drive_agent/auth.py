@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 
 
 _SA_KEYS = (
@@ -11,6 +11,41 @@ _SA_KEYS = (
     "client_id", "auth_uri", "token_uri", "auth_provider_x509_cert_url",
     "client_x509_cert_url", "universe_domain",
 )
+
+
+def _parse_sa(raw, json):
+    """Tolerant parse: strict=False allows raw newlines in the key; also unwraps surrounding quotes / double-encoded JSON."""
+    t = raw.strip()
+    for _ in range(2):
+        try:
+            v = json.loads(t, strict=False)
+        except ValueError:
+            if len(t) > 1 and t[0] == t[-1] and t[0] in "'\"":
+                t = t[1:-1].strip()
+                continue
+            return None
+        if isinstance(v, str):   # JSON string containing JSON
+            t = v
+            continue
+        return v if isinstance(v, dict) else None
+    return None
+
+
+def _json_from_env_file(json):
+    """Fallback: pull the multi-line FIREBASE_SERVICE_ACCOUNT_JSON={...} block straight out of backend/.env."""
+    import re
+    from pathlib import Path
+    try:
+        text = (Path(__file__).resolve().parent.parent / ".env").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.search(r"FIREBASE_SERVICE_ACCOUNT_JSON\s*=\s*['\"]?(\{.*?\})['\"]?\s*(?:\r?\n[A-Za-z_]+=|\Z)", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1), strict=False)
+    except ValueError:
+        return None
 
 
 def load_credentials():
@@ -24,11 +59,22 @@ def load_credentials():
 
     info = None
     raw = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-    if raw:
+    b64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64", "").strip()
+    if b64 and not raw:
+        import base64
         try:
-            info = json.loads(raw)
-        except ValueError:
-            raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON.")
+            raw = base64.b64decode(b64).decode("utf-8")
+        except Exception:
+            raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_B64 is not valid base64.")
+    if raw:
+        info = _parse_sa(raw, json)
+        if info is None:
+            info = _json_from_env_file(json)
+        if info is None:
+            raise RuntimeError(
+                "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON "
+                f"(got {len(raw)} chars, starts with {raw[:1]!r}). Paste the whole service-account JSON "
+                "on one line, or set FIREBASE_SERVICE_ACCOUNT_B64 to its base64.")
     else:
         def env(k: str) -> str:
             return os.getenv(k) or os.getenv(k.upper()) or ""
@@ -62,20 +108,38 @@ def init_firebase() -> None:
 _ADMIN_OK: dict[str, float] = {}   # uid -> expiry (skips Firestore read on every poll)
 
 
-def require_admin(authorization: str | None = Header(default=None)) -> dict:
+def verify_token(authorization: str | None) -> dict:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing login token.")
     init_firebase()
-    from firebase_admin import auth, firestore
+    from firebase_admin import auth
     try:
-        decoded = auth.verify_id_token(authorization[7:].strip())
+        return auth.verify_id_token(authorization[7:].strip())
     except Exception:
         raise HTTPException(401, "Invalid or expired login token.")
-    uid = decoded["uid"]
-    if _ADMIN_OK.get(uid, 0) < time.time():
-        snap = firestore.client().collection("users").document(uid).get()
-        if not snap.exists or (snap.to_dict() or {}).get("role") != "admin":
-            _ADMIN_OK.pop(uid, None)
-            raise HTTPException(403, "Admin access required.")
+
+
+def is_admin(uid: str) -> bool:
+    """users/{uid}.role == 'admin' (cached for 60 s, only when true)."""
+    if _ADMIN_OK.get(uid, 0) >= time.time():
+        return True
+    from firebase_admin import firestore
+    snap = firestore.client().collection("users").document(uid).get()
+    if snap.exists and (snap.to_dict() or {}).get("role") == "admin":
         _ADMIN_OK[uid] = time.time() + 60
-    return {"uid": decoded["uid"], "email": decoded.get("email", "")}
+        return True
+    _ADMIN_OK.pop(uid, None)
+    return False
+
+
+def require_user(authorization: str | None = Header(default=None)) -> dict:
+    """Any signed-in user. Returns {uid, email, isAdmin}."""
+    decoded = verify_token(authorization)
+    uid = decoded["uid"]
+    return {"uid": uid, "email": decoded.get("email", ""), "isAdmin": is_admin(uid)}
+
+
+def require_admin(user: dict = Depends(require_user)) -> dict:
+    if not user["isAdmin"]:
+        raise HTTPException(403, "Admin access required.")
+    return {"uid": user["uid"], "email": user["email"]}

@@ -9,7 +9,10 @@ import 'pages/login.dart';
 import 'firebase_options.dart';
 import 'logging.dart';
 import 'services/admin_service.dart';
+import 'services/download_service.dart';
+import 'services/session_service.dart';
 import 'ui/neo.dart';
+import 'ui/session_gate.dart';
 import 'ui/splash_page.dart';
 
 Future<void> main() async {
@@ -26,6 +29,8 @@ Future<void> main() async {
   );
 
   AdminService.init();
+  SessionService.init();
+  await DownloadService.init();
 
   runApp(const MainApp());
 }
@@ -41,6 +46,7 @@ class MainApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      navigatorKey: SessionService.navigatorKey,
       title: Neo.appName,
       theme: Neo.theme(),
       builder: (context, child) {
@@ -106,7 +112,7 @@ class AuthGate extends StatelessWidget {
         }
 
         if (snapshot.hasData) {
-          return const HomePage();
+          return const SessionGate(child: HomePage());
         }
 
         return const LoginPage();

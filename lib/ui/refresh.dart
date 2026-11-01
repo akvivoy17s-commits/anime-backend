@@ -7,7 +7,10 @@ import 'neo.dart';
 class NeoRefresh extends StatelessWidget {
   final Future<void> Function() onRefresh;
   final Widget child;
-  const NeoRefresh({super.key, required this.onRefresh, required this.child});
+
+  /// Which scroll notifications may start the refresh (default: the normal top-of-list pull).
+  final bool Function(ScrollNotification)? notificationPredicate;
+  const NeoRefresh({super.key, required this.onRefresh, required this.child, this.notificationPredicate});
 
   @override
   Widget build(BuildContext context) {
@@ -15,6 +18,7 @@ class NeoRefresh extends StatelessWidget {
       color: Neo.cyan,
       backgroundColor: Neo.surface,
       onRefresh: onRefresh,
+      notificationPredicate: notificationPredicate ?? defaultScrollNotificationPredicate,
       child: child,
     );
   }

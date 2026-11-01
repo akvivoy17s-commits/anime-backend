@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import '../ui/media.dart';
 import '../ui/neo.dart';
 import '../ui/refresh.dart';
+import '../services/stream_perf.dart';
 import 'video_play.dart';
 import '../ui/save_menu.dart';
 
@@ -60,6 +63,8 @@ class _MoviesPageState extends State<MoviesPage> {
         _shown = _pageSize;
         _loading = false;
       });
+      // get the first movies' stream links ready while the user browses
+      unawaited(StreamWarm.fromDocs(_all.map((d) => d.data())));
     } catch (e) {
       debugPrint('Movies loading error: $e');
       if (!mounted) return;

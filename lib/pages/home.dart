@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import '../services/last_watched_service.dart';
+import '../services/session_service.dart';
 import '../ui/media.dart';
 import '../ui/neo.dart';
 import 'search.dart';
@@ -9,6 +10,7 @@ import 'profile.dart';
 import 'series.dart';
 import 'movies.dart';
 import 'save_list.dart';
+import 'downloads.dart';
 import 'video_play.dart';
 import '../ui/save_menu.dart';
 
@@ -155,26 +157,36 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: NeoBackground(
-        child: SafeArea(
-          bottom: false,
-          child: IndexedStack(
-            index: currentIndex,
-            children: const [
-              _HomeContent(),
-              SeriesPage(),
-              MoviesPage(),
-              SavedPage(),
-              ProfilePage(),
-            ],
+    // Users the admin blocked from downloads do not get the Downloads tab (page index 4).
+    return ValueListenableBuilder<bool>(
+      valueListenable: SessionService.downloadsBlocked,
+      builder: (context, blocked, _) {
+        final tabs = blocked ? const [0, 1, 2, 3, 5] : const [0, 1, 2, 3, 4, 5];
+        final shown = tabs.contains(currentIndex) ? currentIndex : 0;
+        return Scaffold(
+          body: NeoBackground(
+            child: SafeArea(
+              bottom: false,
+              child: IndexedStack(
+                index: shown,
+                children: const [
+                  _HomeContent(),
+                  SeriesPage(),
+                  MoviesPage(),
+                  SavedPage(),
+                  DownloadsPage(),
+                  ProfilePage(),
+                ],
+              ),
+            ),
           ),
-        ),
-      ),
-      bottomNavigationBar: _NeoNavBar(
-        index: currentIndex,
-        onChanged: (i) => setState(() => currentIndex = i),
-      ),
+          bottomNavigationBar: _NeoNavBar(
+            index: shown,
+            tabs: tabs,
+            onChanged: (i) => setState(() => currentIndex = i),
+          ),
+        );
+      },
     );
   }
 }
@@ -185,14 +197,16 @@ class _HomePageState extends State<HomePage> {
 
 class _NeoNavBar extends StatelessWidget {
   final int index;
+  final List<int> tabs; // page indexes that are shown (Downloads can be hidden)
   final ValueChanged<int> onChanged;
-  const _NeoNavBar({required this.index, required this.onChanged});
+  const _NeoNavBar({required this.index, required this.tabs, required this.onChanged});
 
   static const _items = [
     (Icons.home_outlined, Icons.home_rounded, 'Home'),
     (Icons.video_library_outlined, Icons.video_library_rounded, 'Series'),
     (Icons.movie_outlined, Icons.movie_rounded, 'Movies'),
     (Icons.bookmark_border_rounded, Icons.bookmark_rounded, 'Saved'),
+    (Icons.download_outlined, Icons.download_rounded, 'Downloads'),
     (Icons.person_outline_rounded, Icons.person_rounded, 'Profile'),
   ];
 
@@ -208,7 +222,8 @@ class _NeoNavBar extends StatelessWidget {
         child: SizedBox(
           height: 64,
           child: Row(
-            children: List.generate(_items.length, (i) {
+            children: List.generate(tabs.length, (n) {
+              final i = tabs[n];
               final sel = i == index;
               final it = _items[i];
               return Expanded(
@@ -220,7 +235,7 @@ class _NeoNavBar extends StatelessWidget {
                       AnimatedContainer(
                         duration: const Duration(milliseconds: 220),
                         curve: Curves.easeOut,
-                        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 5),
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 5),
                         decoration: BoxDecoration(
                           borderRadius: BorderRadius.circular(14),
                           color: sel ? Neo.cyan.withValues(alpha: 0.16) : Colors.transparent,
@@ -239,8 +254,8 @@ class _NeoNavBar extends StatelessWidget {
                         it.$3.toUpperCase(),
                         style: TextStyle(
                           fontFamily: Neo.mono,
-                          fontSize: 9.5,
-                          letterSpacing: 1,
+                          fontSize: 9,
+                          letterSpacing: 0.4,
                           color: sel ? Neo.cyan : Neo.muted,
                         ),
                       ),
