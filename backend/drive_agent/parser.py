@@ -1,6 +1,7 @@
 """Metadata parser: DriveVideo -> VideoMeta. Pure functions, no I/O, no dependencies."""
 from __future__ import annotations
 import re
+from dataclasses import replace
 
 from .models import DriveVideo, VideoMeta
 
@@ -12,6 +13,8 @@ _NOISE = re.compile(
 _SE_COMBO = re.compile(r"\bS(\d{1,2})[\s._-]*E(?:P)?[\s._-]*(\d{1,4})\b", re.I)
 _X_COMBO = re.compile(r"\b(\d{1,2})x(\d{1,3})\b", re.I)
 _SEASON_EP = re.compile(r"\b(?:Season|Series)[\s._-]*(\d{1,2})\b.{0,15}?\b(?:Episode|Ep)\.?[\s._-]*(\d{1,4})\b", re.I)
+_ORD_SEASON = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)[\s._-]*Season\b", re.I)
+_S_BARE_EP = re.compile(r"\b(?:Season|Series|S)[\s._-]*(\d{1,2})[\s._-]+(?:-[\s._-]*)?(\d{1,3})\b", re.I)
 _EP_ONLY = re.compile(r"\b(?:Episode|Ep|E)\.?[\s._-]*(\d{1,4})\b", re.I)
 _SEASON_ONLY = re.compile(r"\b(?:Season|Series|S)[\s._-]*(\d{1,2})\b", re.I)
 _LEAD_NUM = re.compile(r"^\s*(\d{1,4})\s*[-._)\]]")
@@ -29,12 +32,24 @@ def _clean(text: str) -> str:
     return text.strip(" -_[](){}")
 
 
+def _start_in(stem: str, marker: str):
+    i = stem.find(marker)
+    if i >= 0:
+        return i
+    m = re.search(r"\b(?:Season|Series|S)[\s._-]*\d", stem, re.I)
+    return m.start() if m else None
+
+
 def _find_se(stem: str):
     """Return (season|None, episode|None, marker_start|None)."""
     for rx in (_SE_COMBO, _X_COMBO, _SEASON_EP):
         m = rx.search(stem)
         if m:
             return int(m.group(1)), int(m.group(2)), m.start()
+    clean = _NOISE.sub(" ", stem)                      # so "1080p" / "x265" are never read as numbers
+    m = _S_BARE_EP.search(clean)                       # "Show S02 - 05", "Show Season 2 05"
+    if m and not _EP_ONLY.search(clean):
+        return int(m.group(1)), int(m.group(2)), _start_in(stem, m.group(0))
     s = e = start = None
     m = _EP_ONLY.search(stem)
     if m:
@@ -43,6 +58,11 @@ def _find_se(stem: str):
     if m:
         s = int(m.group(1))
         start = m.start() if start is None else min(start, m.start())
+    else:
+        m = _ORD_SEASON.search(stem)                   # "2nd Season"
+        if m:
+            s = int(m.group(1))
+            start = m.start() if start is None else min(start, m.start())
     return s, e, start
 
 
@@ -62,7 +82,10 @@ def _folder_series(path: str) -> str:
 
 
 def parse(video: DriveVideo, category: str = "series", default_season: int = 1) -> VideoMeta:
-    stem = _EXT.sub("", video.name)
+    # "_" is a word character for \b, so "Show_S01_Ep01_720p" would never match -> treat it as a space
+    stem = _EXT.sub("", video.name).replace("_", " ")
+    stem = re.sub(r"(?<=[A-Za-z0-9])(?=[^\x00-\x7F])|(?<=[^\x00-\x7F])(?=[A-Za-z0-9])", " ", stem)  # "Ep01தமிழ்" -> "Ep01 தமிழ்"
+    video = replace(video, folder_path=video.folder_path.replace("_", " "))
     season, episode, start = _find_se(stem)
 
     if category == "series" and episode is None:           # weak fallbacks, series only
